@@ -10,6 +10,8 @@ import json
 import os
 import subprocess
 import threading
+import urllib.request
+import ipaddress
 from pathlib import Path
 
 # Windows 特殊处理
@@ -39,8 +41,9 @@ try:
     from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
                                   QHBoxLayout, QLabel, QLineEdit, QPushButton, 
                                   QComboBox, QTextEdit, QCheckBox, QGroupBox, 
-                                  QMessageBox, QInputDialog)
+                                  QMessageBox, QInputDialog, QSystemTrayIcon, QMenu, QAction)
     from PyQt5.QtCore import Qt, QThread, pyqtSignal
+    from PyQt5.QtGui import QIcon
     HAS_PYQT = True
     
     # 高 DPI 支持 - 必须在创建 QApplication 之前设置
@@ -54,8 +57,11 @@ except ImportError:
     print("安装命令: pip3 install PyQt5")
     sys.exit(1)
 
-APP_VERSION = "1.1"
+APP_VERSION = "1.0"
 APP_TITLE = f"ECH Workers 客户端 v{APP_VERSION}"
+
+# 中国IP列表URL
+CHINA_IP_LIST_URL = "https://raw.githubusercontent.com/mayaxcn/china-ip-list/master/chn_ip.txt"
 
 # 复用原有的 ConfigManager, ProcessManager, AutoStartManager
 # 从原文件导入这些类（简化版本）
@@ -118,7 +124,8 @@ class ConfigManager:
             'token': '',
             'ip': 'saas.sin.fan',
             'dns': 'dns.alidns.com/dns-query',
-            'ech': 'cloudflare-ech.com'
+            'ech': 'cloudflare-ech.com',
+            'routing_mode': 'bypass_cn'  # 默认跳过中国大陆
         }
         self.servers.append(default_server)
         self.current_server_id = default_server['id']
@@ -327,10 +334,16 @@ class MainWindow(QMainWindow):
         self.config_manager.load_config()
         self.process_thread = None
         self.is_autostart = '-autostart' in sys.argv
+        self.china_ip_ranges = None  # 缓存中国IP列表
+        self.tray_icon = None  # 系统托盘图标
         
         self.init_ui()
         self.init_server_combo()  # 初始化下拉框
         self.load_server_config()
+        self.init_tray_icon()  # 初始化系统托盘
+        
+        # 异步加载中国IP列表
+        self.load_china_ip_list_async()
         
         if self.is_autostart:
             self.hide()
@@ -386,6 +399,20 @@ class MainWindow(QMainWindow):
         advanced_group.setLayout(advanced_layout)
         layout.addWidget(advanced_group)
         
+        # 分流设置
+        routing_group = QGroupBox("分流设置")
+        routing_layout = QHBoxLayout()
+        routing_layout.addWidget(QLabel("代理模式:"))
+        self.routing_combo = QComboBox()
+        self.routing_combo.addItem("全局代理", "global")
+        self.routing_combo.addItem("跳过中国大陆", "bypass_cn")
+        self.routing_combo.addItem("不改变代理", "none")
+        self.routing_combo.currentIndexChanged.connect(self.on_routing_changed)
+        routing_layout.addWidget(self.routing_combo)
+        routing_layout.addStretch()
+        routing_group.setLayout(routing_layout)
+        layout.addWidget(routing_group)
+        
         # 控制按钮
         control_group = QGroupBox("控制")
         control_layout = QHBoxLayout()
@@ -420,6 +447,219 @@ class MainWindow(QMainWindow):
         log_layout.addWidget(self.log_text)
         log_group.setLayout(log_layout)
         layout.addWidget(log_group)
+    
+    def init_tray_icon(self):
+        """初始化系统托盘图标"""
+        if not QSystemTrayIcon.isSystemTrayAvailable():
+            return
+        
+        # 创建系统托盘图标
+        self.tray_icon = QSystemTrayIcon(self)
+        
+        # 尝试创建简单的图标（如果没有图标文件，使用默认图标）
+        try:
+            # 创建一个简单的图标
+            icon = QIcon()
+            # 使用应用程序图标或创建一个简单的图标
+            if hasattr(QApplication, 'style'):
+                icon = self.style().standardIcon(self.style().SP_ComputerIcon)
+            self.tray_icon.setIcon(icon)
+        except:
+            # 如果创建图标失败，使用默认图标
+            pass
+        
+        self.tray_icon.setToolTip(APP_TITLE)
+        
+        # 创建右键菜单
+        tray_menu = QMenu(self)
+        
+        show_action = QAction("显示窗口", self)
+        show_action.triggered.connect(self.show_window)
+        tray_menu.addAction(show_action)
+        
+        hide_action = QAction("隐藏窗口", self)
+        hide_action.triggered.connect(self.hide)
+        tray_menu.addAction(hide_action)
+        
+        tray_menu.addSeparator()
+        
+        quit_action = QAction("退出", self)
+        quit_action.triggered.connect(self.quit_application)
+        tray_menu.addAction(quit_action)
+        
+        self.tray_icon.setContextMenu(tray_menu)
+        
+        # 双击托盘图标显示/隐藏窗口
+        self.tray_icon.activated.connect(self.tray_icon_activated)
+        
+        # 显示托盘图标
+        self.tray_icon.show()
+    
+    def tray_icon_activated(self, reason):
+        """托盘图标激活事件"""
+        if reason == QSystemTrayIcon.DoubleClick:
+            if self.isVisible():
+                self.hide()
+            else:
+                self.show_window()
+    
+    def show_window(self):
+        """显示窗口"""
+        self.show()
+        self.raise_()
+        self.activateWindow()
+    
+    def quit_application(self):
+        """退出应用程序"""
+        # 关闭前清理系统代理
+        if self.system_proxy_enabled:
+            self._set_system_proxy(False)
+        
+        # 停止进程
+        if self.process_thread and self.process_thread.is_running:
+            self.process_thread.stop()
+            self.process_thread.wait()
+        
+        # 隐藏托盘图标
+        if self.tray_icon:
+            self.tray_icon.hide()
+        
+        QApplication.quit()
+    
+    def load_china_ip_list_async(self):
+        """异步加载中国IP列表"""
+        def load_in_thread():
+            try:
+                self.append_log("[系统] 正在加载中国IP列表...\n")
+                ranges = self._load_china_ip_list()
+                if ranges:
+                    self.china_ip_ranges = ranges
+                    self.append_log(f"[系统] 已加载中国IP列表，共 {len(ranges)} 个IP段\n")
+                else:
+                    self.append_log("[系统] 加载中国IP列表失败，使用默认列表\n")
+            except Exception as e:
+                self.append_log(f"[系统] 加载中国IP列表出错: {e}\n")
+        
+        thread = threading.Thread(target=load_in_thread, daemon=True)
+        thread.start()
+    
+    def _load_china_ip_list(self):
+        """下载并解析中国IP列表"""
+        try:
+            # 尝试从缓存读取
+            cache_file = self.config_manager.config_dir / "china_ip_list.json"
+            if cache_file.exists():
+                try:
+                    with open(cache_file, 'r', encoding='utf-8') as f:
+                        cached_data = json.load(f)
+                        # 检查缓存是否过期（24小时）
+                        import time
+                        if time.time() - cached_data.get('timestamp', 0) < 86400:
+                            return cached_data.get('ranges', [])
+                except:
+                    pass
+            
+            # 下载IP列表
+            with urllib.request.urlopen(CHINA_IP_LIST_URL, timeout=10) as response:
+                content = response.read().decode('utf-8')
+            
+            # 解析IP范围
+            ranges = []
+            for line in content.strip().split('\n'):
+                line = line.strip()
+                if not line or line.startswith('#'):
+                    continue
+                
+                parts = line.split()
+                if len(parts) >= 2:
+                    start_ip = parts[0]
+                    end_ip = parts[1]
+                    try:
+                        start = ipaddress.IPv4Address(start_ip)
+                        end = ipaddress.IPv4Address(end_ip)
+                        ranges.append((int(start), int(end)))
+                    except:
+                        continue
+            
+            # 保存到缓存
+            try:
+                import time
+                with open(cache_file, 'w', encoding='utf-8') as f:
+                    json.dump({
+                        'timestamp': time.time(),
+                        'ranges': ranges
+                    }, f)
+            except:
+                pass
+            
+            return ranges
+        except Exception as e:
+            print(f"加载中国IP列表失败: {e}")
+            return None
+    
+    def _convert_ip_ranges_to_wildcards(self, ranges):
+        """将IP范围转换为Windows ProxyOverride通配符格式"""
+        if not ranges:
+            return []
+        
+        wildcards = set()
+        
+        for start, end in ranges:
+            start_ip = ipaddress.IPv4Address(start)
+            end_ip = ipaddress.IPv4Address(end)
+            
+            start_parts = [int(x) for x in str(start_ip).split('.')]
+            end_parts = [int(x) for x in str(end_ip).split('.')]
+            
+            # 如果整个A段相同
+            if start_parts[0] == end_parts[0]:
+                # 检查是否是整个A段 (0.0.0.0 - 255.255.255.255)
+                if start_parts[1] == 0 and end_parts[1] == 255 and \
+                   start_parts[2] == 0 and end_parts[2] == 255 and \
+                   start_parts[3] == 0 and end_parts[3] == 255:
+                    wildcards.add(f"{start_parts[0]}.*")
+                # 检查是否是整个B段 (0.0.0.0 - 0.255.255.255)
+                elif start_parts[2] == 0 and end_parts[2] == 255 and \
+                     start_parts[3] == 0 and end_parts[3] == 255:
+                    wildcards.add(f"{start_parts[0]}.{start_parts[1]}.*")
+                # 检查是否是整个C段 (0.0.0.0 - 0.0.255.255)
+                elif start_parts[3] == 0 and end_parts[3] == 255:
+                    wildcards.add(f"{start_parts[0]}.{start_parts[1]}.{start_parts[2]}.*")
+                else:
+                    # 部分C段，添加所有涉及的IP
+                    # 为了减少数量，只添加C段通配符
+                    for c in range(start_parts[2], end_parts[2] + 1):
+                        wildcards.add(f"{start_parts[0]}.{start_parts[1]}.{c}.*")
+        
+        # 优化：合并可以合并的通配符
+        # 例如：1.0.*, 1.1.*, ..., 1.255.* 可以合并为 1.*
+        optimized = set()
+        a_segments = {}  # {A: set(B segments)}
+        
+        for wc in wildcards:
+            parts = wc.split('.')
+            if len(parts) == 2 and parts[1] == '*':
+                # A.* 格式，直接添加
+                optimized.add(wc)
+            elif len(parts) == 3 and parts[2] == '*':
+                # A.B.* 格式
+                a = parts[0]
+                if a not in a_segments:
+                    a_segments[a] = set()
+                a_segments[a].add(parts[1])
+            else:
+                # 其他格式，直接添加
+                optimized.add(wc)
+        
+        # 检查每个A段是否覆盖了所有B段（0-255），如果是则合并为A.*
+        for a, b_set in a_segments.items():
+            if len(b_set) >= 250:  # 如果覆盖了大部分B段，使用A.*
+                optimized.add(f"{a}.*")
+            else:
+                for b in b_set:
+                    optimized.add(f"{a}.{b}.*")
+        
+        return sorted(list(optimized))
     
     def create_label_edit(self, label_text, edit_widget):
         """创建标签和输入框"""
@@ -464,22 +704,56 @@ class MainWindow(QMainWindow):
             self.ip_edit.setText(server.get('ip', ''))
             self.dns_edit.setText(server.get('dns', ''))
             self.ech_edit.setText(server.get('ech', ''))
+            # 加载分流模式
+            routing_mode = server.get('routing_mode', 'bypass_cn')
+            for i in range(self.routing_combo.count()):
+                if self.routing_combo.itemData(i) == routing_mode:
+                    self.routing_combo.setCurrentIndex(i)
+                    break
     
     def refresh_server_combo(self):
         """刷新服务器下拉框"""
         # 暂时断开信号连接，避免递归
-        self.server_combo.currentIndexChanged.disconnect()
+        try:
+            self.server_combo.currentIndexChanged.disconnect()
+        except:
+            pass
+        
         self.server_combo.clear()
+        
+        # 确保有服务器
+        if not self.config_manager.servers:
+            # 如果没有服务器，添加默认服务器
+            self.config_manager.add_default_server()
+        
         sorted_servers = sorted(self.config_manager.servers, key=lambda x: x['name'])
         for server in sorted_servers:
             self.server_combo.addItem(server['name'], server['id'])
         
+        # 确保有当前服务器
         current = self.config_manager.get_current_server()
         if current:
+            # 查找并选中当前服务器
+            found = False
             for i in range(self.server_combo.count()):
                 if self.server_combo.itemData(i) == current['id']:
                     self.server_combo.setCurrentIndex(i)
+                    found = True
                     break
+            
+            # 如果找不到当前服务器，选中第一个
+            if not found and self.server_combo.count() > 0:
+                self.server_combo.setCurrentIndex(0)
+                # 更新当前服务器ID
+                if self.server_combo.itemData(0):
+                    self.config_manager.current_server_id = self.server_combo.itemData(0)
+        else:
+            # 如果没有当前服务器，选中第一个
+            if self.server_combo.count() > 0:
+                self.server_combo.setCurrentIndex(0)
+                # 更新当前服务器ID
+                if self.server_combo.itemData(0):
+                    self.config_manager.current_server_id = self.server_combo.itemData(0)
         
         # 重新连接信号
         self.server_combo.currentIndexChanged.connect(self.on_server_changed)
@@ -495,6 +769,10 @@ class MainWindow(QMainWindow):
             server['ip'] = self.ip_edit.text()
             server['dns'] = self.dns_edit.text()
             server['ech'] = self.ech_edit.text()
+            # 保存分流模式
+            routing_mode = self.routing_combo.currentData()
+            if routing_mode:
+                server['routing_mode'] = routing_mode
         return server
     
     def on_server_changed(self):
@@ -532,13 +810,28 @@ class MainWindow(QMainWindow):
                 QMessageBox.warning(self, "提示", "服务器名称已存在")
                 return
             
+            # 获取当前界面输入的值作为新服务器的默认值
             current = self.get_control_values()
-            new_server = current.copy() if current else {}
+            # 创建新服务器，只复制配置值，不复制 id 和 name
+            new_server = {
+                'server': current.get('server', '') if current else '',
+                'listen': current.get('listen', '127.0.0.1:30000') if current else '127.0.0.1:30000',
+                'token': current.get('token', '') if current else '',
+                'ip': current.get('ip', 'saas.sin.fan') if current else 'saas.sin.fan',
+                'dns': current.get('dns', 'dns.alidns.com/dns-query') if current else 'dns.alidns.com/dns-query',
+                'ech': current.get('ech', 'cloudflare-ech.com') if current else 'cloudflare-ech.com',
+                'routing_mode': current.get('routing_mode', 'bypass_cn') if current else 'bypass_cn',
+                'name': name
+            }
+            # 添加服务器（会自动生成新的 id）
             self.config_manager.add_server(new_server)
-            new_server['name'] = name
-            self.config_manager.update_server(new_server)
             self.config_manager.save_config()
             self.refresh_server_combo()
+            # 切换到新添加的服务器
+            for i in range(self.server_combo.count()):
+                if self.server_combo.itemText(i) == name:
+                    self.server_combo.setCurrentIndex(i)
+                    break
             self.load_server_config()
             self.append_log(f"[系统] 已添加新服务器: {name}\n")
     
@@ -562,10 +855,18 @@ class MainWindow(QMainWindow):
                                        QMessageBox.Yes | QMessageBox.No)
             if reply == QMessageBox.Yes:
                 name = server['name']
-                self.config_manager.delete_server(server['id'])
+                deleted_id = server['id']
+                
+                # 删除服务器
+                self.config_manager.delete_server(deleted_id)
                 self.config_manager.save_config()
+                
+                # 刷新下拉框（会自动选中新的当前服务器）
                 self.refresh_server_combo()
+                
+                # 加载新当前服务器的配置
                 self.load_server_config()
+                
                 self.append_log(f"[系统] 已删除服务器: {name}\n")
     
     def rename_server(self):
@@ -773,8 +1074,30 @@ class MainWindow(QMainWindow):
         """更新开机启动复选框状态"""
         self.auto_start_check.setChecked(self._is_auto_start_enabled())
     
+    def on_routing_changed(self):
+        """分流模式改变"""
+        # 如果已经设置了系统代理，重新设置以应用新的绕过规则
+        if self.system_proxy_enabled:
+            routing_mode = self.routing_combo.currentData()
+            if routing_mode == 'none':
+                # 如果切换到"不改变代理"，自动关闭系统代理
+                if self._set_system_proxy(False):
+                    self.system_proxy_enabled = False
+                    self.proxy_btn.setText("设置系统代理")
+                    self.append_log("[系统] 分流模式已切换为\"不改变代理\"，已关闭系统代理\n")
+            else:
+                # 重新设置系统代理以应用新的绕过规则
+                if self._set_system_proxy(True):
+                    mode_name = self.routing_combo.currentText()
+                    self.append_log(f"[系统] 分流模式已切换为\"{mode_name}\"，已更新系统代理设置\n")
+    
     def toggle_system_proxy(self):
         """切换系统代理"""
+        routing_mode = self.routing_combo.currentData()
+        if routing_mode == 'none':
+            QMessageBox.information(self, "提示", "当前分流模式为\"不改变代理\"，无法设置系统代理")
+            return
+        
         if self.system_proxy_enabled:
             # 关闭系统代理
             if self._set_system_proxy(False):
@@ -800,10 +1123,21 @@ class MainWindow(QMainWindow):
             if not listen and enabled:
                 return False
             
+            # 获取分流模式
+            routing_mode = self.routing_combo.currentData()
+            if not routing_mode:
+                routing_mode = 'bypass_cn'  # 默认值
+            
+            # 如果是"不改变代理"模式，不设置系统代理
+            if routing_mode == 'none':
+                if enabled:
+                    self.append_log("[系统] 分流模式为\"不改变代理\"，跳过系统代理设置\n")
+                return True
+            
             if sys.platform == 'win32':
-                return self._set_windows_proxy(enabled, listen)
+                return self._set_windows_proxy(enabled, listen, routing_mode)
             elif sys.platform == 'darwin':
-                return self._set_macos_proxy(enabled, listen)
+                return self._set_macos_proxy(enabled, listen, routing_mode)
             else:
                 self.append_log("[系统] Linux 暂不支持自动设置系统代理\n")
                 return False
@@ -811,7 +1145,56 @@ class MainWindow(QMainWindow):
             self.append_log(f"[系统] 设置系统代理失败: {e}\n")
             return False
     
-    def _set_windows_proxy(self, enabled, listen):
+    def _get_proxy_bypass_list(self, routing_mode):
+        """获取代理绕过列表"""
+        # 基础绕过列表（本地和内网）
+        base_bypass = "localhost;127.*;10.*;172.16.*;172.17.*;172.18.*;172.19.*;172.20.*;172.21.*;172.22.*;172.23.*;172.24.*;172.25.*;172.26.*;172.27.*;172.28.*;172.29.*;172.30.*;172.31.*;192.168.*;<local>"
+        
+        if routing_mode == 'global':
+            # 全局代理：只绕过本地和内网
+            return base_bypass
+        elif routing_mode == 'bypass_cn':
+            # 跳过中国大陆：添加中国IP段和常见中国域名
+            cn_domains = [
+                "*.cn", "*.com.cn", "*.net.cn", "*.org.cn", "*.gov.cn", "*.edu.cn",
+                "*.baidu.com", "*.qq.com", "*.taobao.com", "*.tmall.com", "*.alipay.com",
+                "*.weibo.com", "*.sina.com", "*.163.com", "*.126.com", "*.sohu.com",
+                "*.youku.com", "*.iqiyi.com", "*.bilibili.com", "*.douyin.com", "*.douban.com",
+                "*.zhihu.com", "*.jd.com", "*.alibaba.com", "*.1688.com",
+                "*.tencent.com", "*.weixin.qq.com", "*.qzone.com"
+            ]
+            
+            # 使用下载的中国IP列表
+            cn_ip_wildcards = []
+            if self.china_ip_ranges:
+                cn_ip_wildcards = self._convert_ip_ranges_to_wildcards(self.china_ip_ranges)
+            else:
+                # 如果还没加载完成，使用默认的主要IP段
+                cn_ip_wildcards = [
+                    "1.*", "14.*", "27.*", "36.*", "39.*", "42.*", "49.*", "58.*", "59.*", "60.*",
+                    "61.*", "101.*", "103.*", "106.*", "110.*", "111.*", "112.*", "113.*", "114.*", "115.*",
+                    "116.*", "117.*", "118.*", "119.*", "120.*", "121.*", "122.*", "123.*", "124.*", "125.*",
+                    "171.*", "175.*", "180.*", "182.*", "183.*", "202.*", "203.*", "210.*", "211.*", "218.*",
+                    "219.*", "220.*", "221.*", "222.*", "223.*"
+                ]
+            
+            # Windows ProxyOverride 使用分号分隔，支持通配符
+            # 注意：Windows ProxyOverride 有长度限制（约2048字符），需要优化
+            cn_bypass_parts = cn_domains + cn_ip_wildcards
+            cn_bypass = ";".join(cn_bypass_parts)
+            
+            # 如果超过长度限制，只使用域名和主要IP段
+            MAX_LENGTH = 2000
+            if len(cn_bypass) > MAX_LENGTH:
+                # 只使用域名和A段通配符（格式：A.*）
+                a_segment_wildcards = [w for w in cn_ip_wildcards if w.count('.') == 1 and w.endswith('.*')]
+                cn_bypass = ";".join(cn_domains + a_segment_wildcards)
+            
+            return f"{base_bypass};{cn_bypass}"
+        else:
+            return base_bypass
+    
+    def _set_windows_proxy(self, enabled, listen, routing_mode):
         """设置 Windows 系统代理"""
         try:
             import winreg
@@ -822,14 +1205,17 @@ class MainWindow(QMainWindow):
             key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, key_path, 0, winreg.KEY_SET_VALUE)
             
             if enabled:
-                # 设置代理服务器地址 (SOCKS5 代理需要使用 socks=地址)
-                # Windows IE/Edge 不直接支持 SOCKS5，这里设置为 HTTP 代理格式
-                # 用户可能需要使用支持 SOCKS5 的浏览器或工具
-                proxy_server = f"socks={listen}"
+                # Windows 11 需要直接使用 IP:端口 格式，不使用 socks= 前缀
+                # 解析监听地址，提取 IP 和端口
+                if ':' in listen:
+                    proxy_server = listen
+                else:
+                    proxy_server = f"127.0.0.1:{listen}"
                 winreg.SetValueEx(key, "ProxyServer", 0, winreg.REG_SZ, proxy_server)
                 winreg.SetValueEx(key, "ProxyEnable", 0, winreg.REG_DWORD, 1)
-                # 设置不使用代理的地址
-                winreg.SetValueEx(key, "ProxyOverride", 0, winreg.REG_SZ, "localhost;127.*;10.*;172.16.*;172.17.*;172.18.*;172.19.*;172.20.*;172.21.*;172.22.*;172.23.*;172.24.*;172.25.*;172.26.*;172.27.*;172.28.*;172.29.*;172.30.*;172.31.*;192.168.*;<local>")
+                # 根据分流模式设置绕过列表
+                bypass_list = self._get_proxy_bypass_list(routing_mode)
+                winreg.SetValueEx(key, "ProxyOverride", 0, winreg.REG_SZ, bypass_list)
             else:
                 # 关闭代理
                 winreg.SetValueEx(key, "ProxyEnable", 0, winreg.REG_DWORD, 0)
@@ -851,7 +1237,49 @@ class MainWindow(QMainWindow):
             self.append_log(f"[系统] Windows 代理设置失败: {e}\n")
             return False
     
-    def _set_macos_proxy(self, enabled, listen):
+    def _get_macos_bypass_list(self, routing_mode):
+        """获取 macOS 代理绕过列表"""
+        # 基础绕过列表（本地和内网）
+        base_bypass = [
+            "localhost", "127.*", "10.*", "172.16.*", "172.17.*", "172.18.*",
+            "172.19.*", "172.20.*", "172.21.*", "172.22.*", "172.23.*", "172.24.*",
+            "172.25.*", "172.26.*", "172.27.*", "172.28.*", "172.29.*", "172.30.*",
+            "172.31.*", "192.168.*", "*.local", "169.254.*"
+        ]
+        
+        if routing_mode == 'global':
+            # 全局代理：只绕过本地和内网
+            return base_bypass
+        elif routing_mode == 'bypass_cn':
+            # 跳过中国大陆：添加中国域名和IP
+            cn_domains = [
+                "*.cn", "*.com.cn", "*.net.cn", "*.org.cn", "*.gov.cn", "*.edu.cn",
+                "*.baidu.com", "*.qq.com", "*.taobao.com", "*.tmall.com", "*.alipay.com",
+                "*.weibo.com", "*.sina.com", "*.163.com", "*.126.com", "*.sohu.com",
+                "*.youku.com", "*.iqiyi.com", "*.bilibili.com", "*.douyin.com", "*.douban.com",
+                "*.zhihu.com", "*.jd.com", "*.alibaba.com", "*.1688.com",
+                "*.tencent.com", "*.weixin.qq.com", "*.qzone.com"
+            ]
+            
+            # 使用下载的中国IP列表（macOS也支持IP通配符）
+            cn_ip_wildcards = []
+            if self.china_ip_ranges:
+                cn_ip_wildcards = self._convert_ip_ranges_to_wildcards(self.china_ip_ranges)
+            else:
+                # 如果还没加载完成，使用默认的主要IP段
+                cn_ip_wildcards = [
+                    "1.*", "14.*", "27.*", "36.*", "39.*", "42.*", "49.*", "58.*", "59.*", "60.*",
+                    "61.*", "101.*", "103.*", "106.*", "110.*", "111.*", "112.*", "113.*", "114.*", "115.*",
+                    "116.*", "117.*", "118.*", "119.*", "120.*", "121.*", "122.*", "123.*", "124.*", "125.*",
+                    "171.*", "175.*", "180.*", "182.*", "183.*", "202.*", "203.*", "210.*", "211.*", "218.*",
+                    "219.*", "220.*", "221.*", "222.*", "223.*"
+                ]
+            
+            return base_bypass + cn_domains + cn_ip_wildcards
+        else:
+            return base_bypass
+    
+    def _set_macos_proxy(self, enabled, listen, routing_mode):
         """设置 macOS 系统代理"""
         try:
             # 解析监听地址
@@ -870,12 +1298,21 @@ class MainWindow(QMainWindow):
             services = [line.strip() for line in result.stdout.strip().split('\n')[1:] 
                        if line.strip() and not line.startswith('*')]
             
+            # 获取绕过列表
+            bypass_list = self._get_macos_bypass_list(routing_mode)
+            bypass_string = " ".join(bypass_list)
+            
             for service in services:
                 try:
                     if enabled:
                         # 设置 SOCKS 代理
                         subprocess.run(
                             ['networksetup', '-setsocksfirewallproxy', service, host, port],
+                            capture_output=True, check=True
+                        )
+                        # 设置绕过列表
+                        subprocess.run(
+                            ['networksetup', '-setsocksfirewallproxybypassdomains', service] + bypass_list,
                             capture_output=True, check=True
                         )
                         subprocess.run(
@@ -899,17 +1336,29 @@ class MainWindow(QMainWindow):
     
     def closeEvent(self, event):
         """窗口关闭事件"""
-        # 关闭前清理系统代理
-        if self.system_proxy_enabled:
-            self._set_system_proxy(False)
-            self.append_log("[系统] 程序关闭，已清理系统代理\n")
-        
-        # 停止进程
-        if self.process_thread and self.process_thread.is_running:
-            self.process_thread.stop()
-            self.process_thread.wait()
-        
-        event.accept()
+        # 如果系统托盘可用，最小化到托盘而不是关闭
+        if self.tray_icon and self.tray_icon.isVisible():
+            event.ignore()
+            self.hide()
+            self.tray_icon.showMessage(
+                APP_TITLE,
+                "程序已最小化到系统托盘",
+                QSystemTrayIcon.Information,
+                2000
+            )
+        else:
+            # 如果没有托盘图标，正常关闭
+            # 关闭前清理系统代理
+            if self.system_proxy_enabled:
+                self._set_system_proxy(False)
+                self.append_log("[系统] 程序关闭，已清理系统代理\n")
+            
+            # 停止进程
+            if self.process_thread and self.process_thread.is_running:
+                self.process_thread.stop()
+                self.process_thread.wait()
+            
+            event.accept()
     
     def auto_start(self):
         """自动启动"""
